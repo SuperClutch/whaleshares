@@ -1,0 +1,140 @@
+#!/bin/bash
+
+WHALED="/usr/local/whaleshares/bin/whaled"
+
+VERSION=`cat /etc/whaledversion`
+
+chown -R whaled:whaled $HOME
+
+ARGS=""
+
+if [[ ! -z "$SEED_NODES" ]]; then
+    for NODE in $SEED_NODES ; do
+        ARGS+=" --seed-node=$NODE"
+    done
+fi
+
+if [[ ! -z "$RPC_NODES" ]]; then
+    for NODE in $RPC_NODES ; do
+        ARGS+="--rpc-endpoint=$NODE"
+    done
+fi
+
+if [[ ! -z "$WITNESS_NAME" ]]; then
+    ARGS+=" --witness=\"$WITNESS_NAME\""
+fi
+
+if [[ ! -z "$PRIVATE_KEY" ]]; then
+    ARGS+=" --private-key=$PRIVATE_KEY"
+fi
+
+NOW=`date +%s`
+FEED_START_TIME=`expr $NOW - 1209600`
+
+ARGS+=" --follow-start-feeds=$FEED_START_TIME"
+
+# overwrite local config with image one
+if [[ "$USE_FULL_WEB_NODE" ]]; then
+  cp /etc/whaled/fullnode.config.ini $HOME/config.ini
+elif [[ "$USE_WITNESS_NODE" ]]; then
+  cp /etc/whaled/witness.config.ini $HOME/config.ini
+  sed -i s"|0000000000000000000000000000000000000000000000000000000000000000|${P2P_PRIVATE_KEY}|" $HOME/config.ini
+fi
+
+chown whaled:whaled $HOME/config.ini
+
+SHARED_FILE_DIR=$(awk -F= '/shared-file-dir/ { print $2 }' $HOME/config.ini | tr -d ' ' )
+SHARED_FILE_DIR="${SHARED_FILEDIR}shared_memory.meta" 
+if [[ -s $HOME/blockchain/block_log ]]; then
+    if [ ! -f SHARED_FILE_DIR ]; then
+        ARGS+=" --replay-blockchain"
+    fi
+elif [[ -e /var/cache/whaled/blocks.tbz2 ]]; then
+    # init with blockchain cached in image
+    ARGS+=" --replay-blockchain"
+    mkdir -p $HOME/blockchain/database
+    cd $HOME/blockchain/database
+    tar xvjpf /var/cache/whaled/blocks.tbz2
+    chown -R whaled:whaled $HOME/blockchain
+fi
+
+# without --data-dir it uses cwd as datadir(!)
+# who knows what else it dumps into current dir
+cd $HOME
+
+# slow down restart loop if flapping
+sleep 1
+
+mv /etc/nginx/nginx.conf /etc/nginx/nginx.original.conf
+cp /etc/nginx/whaled.nginx.conf /etc/nginx/nginx.conf
+
+#start multiple read-only instances based on the number of cores
+#attach to the local interface since a proxy will be used to loadbalance
+if [[ "$USE_MULTICORE_READONLY" ]]; then
+    exec chpst -uwhaled \
+        $WHALED \
+            --rpc-endpoint=127.0.0.1:8091 \
+            --p2p-endpoint=0.0.0.0:2001 \
+            --data-dir=$HOME \
+            $ARGS \
+            $EXTRA_OPTS \
+            2>&1 &
+    # sleep for a moment to allow the writer node to be ready to accept connections from the readers
+    sleep 30
+    PORT_NUM=8092
+    cp /etc/nginx/healthcheck.conf.template /etc/nginx/healthcheck.conf
+    CORES=$(nproc)
+    PROCESSES=$((CORES * 4))
+    for (( i=2; i<=$PROCESSES; i++ ))
+      do
+        echo server 127.0.0.1:$PORT_NUM\; >> /etc/nginx/healthcheck.conf
+        ((PORT_NUM++))
+    done
+    echo } >> /etc/nginx/healthcheck.conf
+    PORT_NUM=8092
+    for (( i=2; i<=$PROCESSES; i++ ))
+      do
+        exec chpst -uwhaled \
+        $WHALED \
+          --rpc-endpoint=127.0.0.1:$PORT_NUM \
+          --data-dir=$HOME \
+          --read-forward-rpc=127.0.0.1:8091 \
+          --read-only \
+          2>&1 &
+          ((PORT_NUM++))
+          sleep 1
+    done
+    # start nginx now that the config file is complete with all endpoints
+    # all of the read-only processes will connect to the write node onport 8091
+    # nginx will balance all incoming traffic on port 8090
+    rm /etc/nginx/sites-enabled/default
+    cp /etc/nginx/healthcheck.conf /etc/nginx/sites-enabled/default
+    /etc/init.d/fcgiwrap restart
+    echo daemon off\; >> /etc/nginx/nginx.conf
+    service nginx restart
+elif [[ "$USE_NGINX_FRONTEND" ]]; then
+    cp /etc/nginx/healthcheck.conf.template /etc/nginx/healthcheck.conf
+    echo server 127.0.0.1:8091\; >> /etc/nginx/healthcheck.conf
+    echo } >> /etc/nginx/healthcheck.conf
+    rm /etc/nginx/sites-enabled/default
+    cp /etc/nginx/healthcheck.conf /etc/nginx/sites-enabled/default
+    /etc/init.d/fcgiwrap restart
+    service nginx restart
+    exec chpst -uwhaled \
+        $WHALED \
+            --rpc-endpoint=0.0.0.0:8091 \
+            --p2p-endpoint=0.0.0.0:2001 \
+            --data-dir=$HOME \
+            $ARGS \
+            $EXTRA_OPTS \
+            2>&1
+else
+    exec chpst -uwhaled \
+        $WHALED \
+            --rpc-endpoint=0.0.0.0:8090 \
+            --p2p-endpoint=0.0.0.0:2001 \
+            --data-dir=$HOME \
+            $ARGS \
+            $EXTRA_OPTS \
+            2>&1
+fi

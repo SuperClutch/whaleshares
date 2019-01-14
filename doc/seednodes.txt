@@ -1,0 +1,4 @@
+seed01.wls.services:2001            # baabeetaa
+seed02.wls.services:2001            # baabeetaa
+173.212.235.53:2012                 # startail
+seed.whaleshares.bangzi.info:55505  # bangzi
